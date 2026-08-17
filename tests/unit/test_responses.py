@@ -1,8 +1,10 @@
 from typing import Any, cast
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from pydantic import ValidationError
 
+from any_llm import AnyLLM
 from any_llm.api import aresponses
 from any_llm.types.responses import ResponsesParams
 
@@ -93,10 +95,6 @@ def test_responses_params_rejects_top_level_dictionary_input() -> None:
 @pytest.mark.asyncio
 async def test_timeout_forwarded_to_provider_not_params() -> None:
     """timeout is an SDK request option: it must reach the provider call, never ResponsesParams."""
-    from unittest.mock import AsyncMock, patch
-
-    from any_llm import AnyLLM
-
     llm = AnyLLM.create("openai", api_key="test-key")
     with patch.object(type(llm), "_aresponses", new=AsyncMock(return_value=object())) as mock_aresponses:
         await llm.aresponses("gpt-4.1-mini", "hello", timeout=60)

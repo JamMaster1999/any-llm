@@ -102,3 +102,26 @@ async def test_timeout_forwarded_to_provider_not_params() -> None:
     assert mock_aresponses.call_args.kwargs["timeout"] == 60
     params = mock_aresponses.call_args.args[0]
     assert "timeout" not in params.model_dump(exclude_none=True)
+
+
+@pytest.mark.asyncio
+async def test_tools_flattened_for_responses() -> None:
+    """Callables and chat-format tools must reach the provider flat; built-ins pass untouched."""
+
+    def add(a: int, b: int) -> int:
+        """Add two numbers."""
+        return a + b
+
+    chat_format = {"type": "function", "function": {"name": "sub", "parameters": {}, "strict": True}}
+    flat = {"type": "function", "name": "mul", "parameters": {}}
+    builtin = {"type": "web_search"}
+
+    llm = AnyLLM.create("openai", api_key="test-key")
+    with patch.object(type(llm), "_aresponses", new=AsyncMock(return_value=object())) as mock_aresponses:
+        await llm.aresponses("gpt-4.1-mini", "hello", tools=[add, chat_format, flat, builtin])
+
+    tools = mock_aresponses.call_args.args[0].tools
+    assert [tool.get("name") for tool in tools[:3]] == ["add", "sub", "mul"]
+    assert all("function" not in tool for tool in tools[:3])
+    assert tools[1]["strict"] is True
+    assert tools[3] == {"type": "web_search"}

@@ -127,6 +127,9 @@ class ChoiceDelta(OpenAIChoiceDelta):
     images: list[dict[str, Any]] | None = None
     """Streaming counterpart of ``ChatCompletionMessage.images``."""
 
+    audio: dict[str, Any] | None = None
+    """Streaming counterpart of ``ChatCompletionMessage.audio``: raw ``{"data", "mime_type"}`` pieces, since a WAV header needs the total length."""
+
 
 class ChunkChoice(OpenAIChunkChoice):
     delta: ChoiceDelta

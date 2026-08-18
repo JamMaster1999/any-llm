@@ -363,6 +363,32 @@ def _inline_image_block(part: types.Part) -> dict[str, Any] | None:
     return {"type": "image_url", "image_url": {"url": f"data:{blob.mime_type};base64,{encoded_data}"}}
 
 
+def _inline_audio_blob(part: types.Part) -> types.Blob | None:
+    """The part's inline blob when it carries audio, else None."""
+    blob = part.inline_data
+    if blob is None or blob.data is None or not blob.mime_type:
+        return None
+    if not blob.mime_type.startswith("audio/"):
+        return None
+    return blob
+
+
+def _wav_from_pcm(pcm: bytes, mime_type: str) -> bytes:
+    """Wrap TTS raw PCM in a WAV header; the sample rate exists only in the mime type."""
+    rate = 24000
+    for param in mime_type.split(";"):
+        if param.strip().startswith("rate="):
+            rate = int(param.strip().removeprefix("rate="))
+    return (
+        b"RIFF" + (36 + len(pcm)).to_bytes(4, "little") + b"WAVE"
+        + b"fmt " + (16).to_bytes(4, "little")
+        + (1).to_bytes(2, "little") + (1).to_bytes(2, "little")          # PCM format, mono
+        + rate.to_bytes(4, "little") + (rate * 2).to_bytes(4, "little")  # sample rate, byte rate
+        + (2).to_bytes(2, "little") + (16).to_bytes(2, "little")         # block align, 16-bit
+        + b"data" + len(pcm).to_bytes(4, "little") + pcm
+    )
+
+
 _FINISH_REASON_MAP: dict[types.FinishReason, Literal["stop", "length", "content_filter"]] = {
     types.FinishReason.STOP: "stop",
     types.FinishReason.MAX_TOKENS: "length",
@@ -420,6 +446,8 @@ def _convert_response_to_response_dict(response: types.GenerateContentResponse) 
         tool_calls_list: list[dict[str, Any]] = []
         text_content = None
         images: list[dict[str, Any]] = []
+        audio_pcm: list[bytes] = []
+        audio_mime = ""
         parts = candidate.content.parts if candidate.content else None
 
         for part in parts or []:
@@ -447,13 +475,21 @@ def _convert_response_to_response_dict(response: types.GenerateContentResponse) 
                 tool_calls_list.append(tool_call_dict)
             elif part_text := getattr(part, "text", None):
                 text_content = (text_content or "") + part_text
+            elif audio_blob := _inline_audio_blob(part):
+                audio_pcm.append(audio_blob.data or b"")
+                audio_mime = audio_blob.mime_type or ""
             elif image_block := _inline_image_block(part):
                 images.append(image_block)
 
         # Truncated or filtered responses produce a choice even without content or tool
         # calls, e.g. a thinking model that spent the whole max_output_tokens budget on
         # reasoning, so callers see the terminal reason instead of an empty choices list.
-        if tool_calls_list or text_content or images or mapped_finish_reason in ("length", "content_filter"):
+        audio = None
+        if audio_pcm:
+            wav = _wav_from_pcm(b"".join(audio_pcm), audio_mime)
+            audio = {"id": "", "data": base64.b64encode(wav).decode("utf-8"), "expires_at": 0, "transcript": ""}
+
+        if tool_calls_list or text_content or images or audio or mapped_finish_reason in ("length", "content_filter"):
             choices.append(
                 {
                     "message": {
@@ -462,6 +498,7 @@ def _convert_response_to_response_dict(response: types.GenerateContentResponse) 
                         "reasoning": reasoning or None,
                         "tool_calls": tool_calls_list or None,
                         "images": images or None,
+                        "audio": audio,
                     },
                     "finish_reason": _resolve_finish_reason(mapped_finish_reason, bool(tool_calls_list)) or "stop",
                     "index": 0,
@@ -523,6 +560,8 @@ def _create_openai_chunk_from_google_chunk(
     reasoning_content = ""
     tool_calls_list: list[ChoiceDeltaToolCall] = []
     images: list[dict[str, Any]] = []
+    audio_pcm: list[bytes] = []
+    audio_mime = ""
 
     # Content can be absent on terminal chunks, e.g. when the response is truncated or
     # filtered before any part is produced; the finish reason must still be surfaced.
@@ -558,6 +597,9 @@ def _create_openai_chunk_from_google_chunk(
             )
         elif part.text:
             content += part.text
+        elif audio_blob := _inline_audio_blob(part):
+            audio_pcm.append(audio_blob.data or b"")
+            audio_mime = audio_blob.mime_type or ""
         elif image_block := _inline_image_block(part):
             images.append(image_block)
 
@@ -570,6 +612,9 @@ def _create_openai_chunk_from_google_chunk(
         reasoning=Reasoning(content=reasoning_content) if reasoning_content else None,
         tool_calls=tool_calls_list or None,
         images=images or None,
+        audio={"data": base64.b64encode(b"".join(audio_pcm)).decode("utf-8"), "mime_type": audio_mime}
+        if audio_pcm
+        else None,
     )
 
     choice = ChunkChoice(

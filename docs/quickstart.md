@@ -179,6 +179,10 @@ for image in response.choices[0].message.images or []:
 
 The same blocks arrive on `chunk.choices[0].delta.images` when streaming, and they are in the shape any-llm accepts for image input, so an image can be passed straight back in a follow-up message.
 
+## Generated Audio
+
+Models that return audio put it on `message.audio` as a base64 file: OpenAI's `gpt-4o-audio` in the format you request, Gemini's TTS models as raw PCM wrapped into a playable WAV. When streaming Gemini, chunks carry raw `{"data", "mime_type"}` pieces on `delta.audio`; concatenate them and add the WAV header after the last chunk.
+
 ## Embeddings
 
 `embedding` and `aembedding` allow you to create vector embeddings from text using the same unified interface across providers.

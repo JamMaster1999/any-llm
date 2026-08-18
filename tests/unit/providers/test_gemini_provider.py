@@ -2708,3 +2708,96 @@ async def test_service_tier_omitted_when_not_requested() -> None:
 
         _, call_kwargs = mock_genai.return_value.aio.models.generate_content.call_args
         assert call_kwargs["config"].service_tier is None
+
+
+def test_convert_response_wraps_tts_audio_as_playable_wav() -> None:
+    """message.audio carries a finished file, so the conversion adds the WAV header itself."""
+    pcm = b"\x01\x02\x03\x04"
+    response = _make_gemini_response(
+        [types.Part(inline_data=types.Blob(mime_type="audio/L16;codec=pcm;rate=24000", data=pcm))],
+        types.FinishReason.STOP,
+    )
+
+    response_dict = _convert_response_to_response_dict(response)
+
+    assert len(response_dict["choices"]) == 1
+    choice = response_dict["choices"][0]
+    assert choice["finish_reason"] == "stop"
+    assert choice["message"]["content"] is None
+    wav = base64.b64decode(choice["message"]["audio"]["data"])
+    assert wav[:4] == b"RIFF" and wav[8:12] == b"WAVE"
+    assert int.from_bytes(wav[24:28], "little") == 24000
+    assert wav.endswith(pcm)
+
+
+def test_convert_response_audio_rate_comes_from_the_mime_type() -> None:
+    response = _make_gemini_response(
+        [types.Part(inline_data=types.Blob(mime_type="audio/L16;rate=16000", data=b"\x00\x00"))],
+        types.FinishReason.STOP,
+    )
+
+    wav = base64.b64decode(_convert_response_to_response_dict(response)["choices"][0]["message"]["audio"]["data"])
+
+    assert int.from_bytes(wav[24:28], "little") == 16000
+
+
+def test_convert_response_joins_audio_pieces_before_the_header() -> None:
+    """Multiple audio parts are one recording split into pieces, not several files."""
+    response = _make_gemini_response(
+        [
+            types.Part(inline_data=types.Blob(mime_type="audio/L16;rate=24000", data=b"first")),
+            types.Part(inline_data=types.Blob(mime_type="audio/L16;rate=24000", data=b"second")),
+        ],
+        types.FinishReason.STOP,
+    )
+
+    wav = base64.b64decode(_convert_response_to_response_dict(response)["choices"][0]["message"]["audio"]["data"])
+
+    assert wav.endswith(b"firstsecond")
+    assert int.from_bytes(wav[40:44], "little") == len(b"firstsecond")
+
+
+def test_convert_response_keeps_text_next_to_audio() -> None:
+    response = _make_gemini_response(
+        [
+            types.Part(text="Reading it aloud."),
+            types.Part(inline_data=types.Blob(mime_type="audio/L16;rate=24000", data=b"\x00\x00")),
+        ],
+        types.FinishReason.STOP,
+    )
+
+    message = _convert_response_to_response_dict(response)["choices"][0]["message"]
+    assert message["content"] == "Reading it aloud."
+    assert message["audio"] is not None
+    assert message["images"] is None
+
+
+def test_convert_response_routes_image_and_audio_blobs_to_their_own_fields() -> None:
+    response = _make_gemini_response(
+        [
+            types.Part(inline_data=types.Blob(mime_type="image/png", data=b"\x89PNG")),
+            types.Part(inline_data=types.Blob(mime_type="audio/L16;rate=24000", data=b"\x00\x00")),
+        ],
+        types.FinishReason.STOP,
+    )
+
+    message = _convert_response_to_response_dict(response)["choices"][0]["message"]
+    assert len(message["images"]) == 1
+    assert message["audio"] is not None
+
+
+def test_streaming_chunk_carries_raw_audio_pieces_with_their_mime() -> None:
+    """Stream chunks carry raw pieces; the caller adds the header, which needs the total length."""
+    mock_response = _make_gemini_response(
+        [types.Part(inline_data=types.Blob(mime_type="audio/L16;codec=pcm;rate=24000", data=b"piece"))],
+        None,
+    )
+
+    chunk = _create_openai_chunk_from_google_chunk(mock_response)
+
+    delta = chunk.choices[0].delta
+    assert delta.audio == {
+        "data": base64.b64encode(b"piece").decode("utf-8"),
+        "mime_type": "audio/L16;codec=pcm;rate=24000",
+    }
+    assert delta.images is None

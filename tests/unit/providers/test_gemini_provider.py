@@ -1,4 +1,5 @@
 import base64
+import json
 from collections.abc import AsyncIterator
 from contextlib import contextmanager
 from typing import Any, get_args
@@ -1811,6 +1812,88 @@ def test_convert_messages_text_turn_replays_thought_signature() -> None:
     assert formatted_messages[1].parts[0].thought_signature == b"test-signature-bytes"
 
 
+@pytest.mark.parametrize(
+    "extra_content",
+    [
+        "not-a-dict",
+        {"google": "not-a-dict"},
+        {"anthropic": {"signature": "abc"}},
+        {"google": {"thought_signature": None}},
+    ],
+)
+def test_convert_messages_treats_a_non_google_extra_content_as_unsigned(extra_content: Any) -> None:
+    """extra_content that carries no Google signature leaves the part unsigned."""
+    messages: list[dict[str, Any]] = [{"role": "assistant", "content": "42", "extra_content": extra_content}]
+
+    formatted_messages, _ = _convert_messages(messages)
+
+    assert formatted_messages[0].parts is not None
+    assert formatted_messages[0].parts[0].thought_signature is None
+
+
+@pytest.mark.parametrize("signature", ["", "not!!base64@@", 123, ["sig"]])
+def test_convert_messages_text_turn_rejects_an_undecodable_signature(signature: Any) -> None:
+    """An undecodable signature is a caller error, not a bare pydantic ValidationError."""
+    messages: list[dict[str, Any]] = [
+        {"role": "assistant", "content": "42", "extra_content": {"google": {"thought_signature": signature}}}
+    ]
+
+    with pytest.raises(InvalidRequestError, match="thought_signature"):
+        _convert_messages(messages)
+
+
+@pytest.mark.parametrize("signature", ["", "not!!base64@@", 123, ["sig"]])
+def test_convert_messages_tool_call_rejects_an_undecodable_signature(signature: Any) -> None:
+    """The tool call path rejects the same shapes the text path does."""
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "f", "arguments": "{}"},
+                    "extra_content": {"google": {"thought_signature": signature}},
+                }
+            ],
+        }
+    ]
+
+    with pytest.raises(InvalidRequestError, match="thought_signature"):
+        _convert_messages(messages)
+
+
+@pytest.mark.parametrize("signature", ["dGVzdA==", "dGVzdA", "-_8-P76_", b"test-signature-bytes"])
+def test_convert_messages_accepts_every_signature_spelling_the_sdk_decodes(signature: Any) -> None:
+    """Unpadded and URL-safe base64, and raw bytes, all reach the part decoded."""
+    messages: list[dict[str, Any]] = [
+        {"role": "assistant", "content": "42", "extra_content": {"google": {"thought_signature": signature}}}
+    ]
+
+    formatted_messages, _ = _convert_messages(messages)
+
+    assert formatted_messages[0].parts is not None
+    assert formatted_messages[0].parts[0].thought_signature is not None
+
+
+def test_convert_messages_tool_call_without_a_signature_keeps_the_skip_sentinel() -> None:
+    """An unsigned first function call still gets Google's skip sentinel, unvalidated."""
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "f", "arguments": "{}"}}],
+        }
+    ]
+
+    formatted_messages, _ = _convert_messages(messages)
+
+    assert formatted_messages[0].parts is not None
+    part_json = json.loads(formatted_messages[0].parts[0].model_dump_json(exclude_none=True))
+    assert part_json["thought_signature"] == "skip_thought_signature_validator"
+
+
 def test_convert_messages_with_thought_signature_in_extra_content() -> None:
     # Use valid base64 that round-trips correctly
     original_bytes = b"test-signature-bytes"
@@ -1842,30 +1925,6 @@ def test_convert_messages_with_thought_signature_in_extra_content() -> None:
     assert assistant_message.parts is not None
     assert len(assistant_message.parts) == 1
     assert assistant_message.parts[0].thought_signature == original_bytes
-
-
-def test_convert_messages_replayed_message_object_keeps_thought_signature() -> None:
-    """Replaying a returned ChatCompletionMessage (dumped as acompletion does) must keep the signature."""
-    base64_signature = base64.b64encode(b"test-signature-bytes").decode("utf-8")
-    message = ChatCompletionMessage(
-        role="assistant",
-        content=None,
-        tool_calls=[
-            ChatCompletionMessageFunctionToolCall(
-                id="call_123",
-                type="function",
-                function=Function(name="get_weather", arguments='{"location": "Paris"}'),
-                extra_content={"google": {"thought_signature": base64_signature}},
-            )
-        ],
-    )
-    replayed = message.model_dump(exclude_none=True, exclude={"reasoning"})
-
-    formatted_messages, _ = _convert_messages([{"role": "user", "content": "What is the weather?"}, replayed])
-
-    assert replayed["tool_calls"][0]["extra_content"] == {"google": {"thought_signature": base64_signature}}
-    assert formatted_messages[1].parts is not None
-    assert formatted_messages[1].parts[0].thought_signature == b"test-signature-bytes"
 
 
 def _function_response_names(contents: list[types.Content]) -> list[str | None]:
@@ -1917,6 +1976,30 @@ def test_convert_messages_tool_result_name_explicit_wins_else_unknown() -> None:
     formatted_messages, _ = _convert_messages(messages)
 
     assert _function_response_names(formatted_messages) == ["explicit_name", "unknown", "unknown"]
+
+
+def test_convert_messages_replayed_message_object_keeps_thought_signature() -> None:
+    """Replaying a returned ChatCompletionMessage (dumped as acompletion does) must keep the signature."""
+    base64_signature = base64.b64encode(b"test-signature-bytes").decode("utf-8")
+    message = ChatCompletionMessage(
+        role="assistant",
+        content=None,
+        tool_calls=[
+            ChatCompletionMessageFunctionToolCall(
+                id="call_123",
+                type="function",
+                function=Function(name="get_weather", arguments='{"location": "Paris"}'),
+                extra_content={"google": {"thought_signature": base64_signature}},
+            )
+        ],
+    )
+    replayed = message.model_dump(exclude_none=True, exclude={"reasoning"})
+
+    formatted_messages, _ = _convert_messages([{"role": "user", "content": "What is the weather?"}, replayed])
+
+    assert replayed["tool_calls"][0]["extra_content"] == {"google": {"thought_signature": base64_signature}}
+    assert formatted_messages[1].parts is not None
+    assert formatted_messages[1].parts[0].thought_signature == b"test-signature-bytes"
 
 
 def test_convert_messages_with_base64_image() -> None:

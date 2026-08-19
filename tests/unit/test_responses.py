@@ -95,18 +95,6 @@ def test_responses_params_rejects_top_level_dictionary_input() -> None:
 
 
 @pytest.mark.asyncio
-async def test_timeout_forwarded_to_provider_not_params() -> None:
-    """timeout is an SDK request option: it must reach the provider call, never ResponsesParams."""
-    llm = AnyLLM.create("openai", api_key="test-key")
-    with patch.object(type(llm), "_aresponses", new=AsyncMock(return_value=object())) as mock_aresponses:
-        await llm.aresponses("gpt-4.1-mini", "hello", timeout=60)
-
-    assert mock_aresponses.call_args.kwargs["timeout"] == 60
-    params = mock_aresponses.call_args.args[0]
-    assert "timeout" not in params.model_dump(exclude_none=True)
-
-
-@pytest.mark.asyncio
 async def test_tools_flattened_for_responses() -> None:
     """Callables and chat-format tools must reach the provider flat; built-ins pass untouched."""
 

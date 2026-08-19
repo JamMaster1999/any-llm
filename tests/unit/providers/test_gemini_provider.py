@@ -1866,6 +1866,7 @@ def test_convert_messages_replayed_message_object_keeps_thought_signature() -> N
     assert formatted_messages[1].parts is not None
     assert formatted_messages[1].parts[0].thought_signature == b"test-signature-bytes"
 
+
 def _function_response_names(contents: list[types.Content]) -> list[str | None]:
     names = []
     for content in contents:

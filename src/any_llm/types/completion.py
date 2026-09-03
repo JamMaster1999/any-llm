@@ -108,6 +108,7 @@ class ChatCompletionMessage(OpenAIChatCompletionMessage):
 
     images: list[ImageContent] | None = None
     audio: AudioContent | None = None
+    """Generated audio, base64 in ``data``. Gemini TTS output is wrapped as WAV so it plays as-is."""
 
 
 class Choice(OpenAIChoice):
@@ -157,6 +158,8 @@ class ChoiceDelta(OpenAIChoiceDelta):
 
     images: list[ImageContent] | None = None
     audio: AudioContent | None = None
+    """Streaming counterpart of ``ChatCompletionMessage.audio``: raw pieces, as with OpenAI's
+    ``pcm16`` stream (16-bit mono, 24 kHz for Gemini TTS). A WAV header needs the total length."""
 
 
 class ChunkChoice(OpenAIChunkChoice):

@@ -422,8 +422,8 @@ def _inline_data_image(part: types.Part) -> dict[str, Any] | None:
     }
 
 
-def _inline_data_audio(part: types.Part, transcript: str) -> dict[str, Any] | None:
-    """Convert Gemini audio inline data into an OpenAI-compatible audio object."""
+def _inline_audio_blob(part: types.Part) -> types.Blob | None:
+    """The part's inline blob when it carries audio bytes, else None."""
     blob = part.inline_data
     if (
         blob is None
@@ -433,9 +433,49 @@ def _inline_data_audio(part: types.Part, transcript: str) -> dict[str, Any] | No
         or not blob.mime_type.startswith("audio/")
     ):
         return None
+    return blob
+
+
+def _wav_from_pcm(pcm: bytes, mime_type: str) -> bytes:
+    """Wrap headerless 16-bit mono PCM in a WAV header; the sample rate exists only in the mime type."""
+    rate = 24000
+    for param in mime_type.split(";"):
+        if param.strip().startswith("rate="):
+            rate = int(param.strip().removeprefix("rate="))
+    return (
+        b"RIFF"
+        + (36 + len(pcm)).to_bytes(4, "little")
+        + b"WAVE"
+        + b"fmt "
+        + (16).to_bytes(4, "little")
+        + (1).to_bytes(2, "little")
+        + (1).to_bytes(2, "little")  # PCM format, mono
+        + rate.to_bytes(4, "little")
+        + (rate * 2).to_bytes(4, "little")  # sample rate, byte rate
+        + (2).to_bytes(2, "little")
+        + (16).to_bytes(2, "little")  # block align, 16-bit
+        + b"data"
+        + len(pcm).to_bytes(4, "little")
+        + pcm
+    )
+
+
+def _inline_data_audio(blobs: list[types.Blob], transcript: str, *, playable: bool) -> dict[str, Any] | None:
+    """Convert Gemini audio blobs into an OpenAI-compatible audio object.
+
+    TTS models return raw ``audio/L16`` PCM. A complete message gets a WAV header so the
+    bytes are playable as-is; streaming pieces stay raw, as with OpenAI's ``pcm16`` stream,
+    since a WAV header needs the total length. Other audio formats pass through untouched.
+    """
+    if not blobs:
+        return None
+    data = b"".join(cast("bytes", blob.data) for blob in blobs)
+    mime_type = cast("str", blobs[0].mime_type)
+    if playable and mime_type.startswith("audio/L16"):
+        data = _wav_from_pcm(data, mime_type)
     return {
         "id": "google_genai_audio",
-        "data": base64.b64encode(blob.data).decode("ascii"),
+        "data": base64.b64encode(data).decode("ascii"),
         "expires_at": 0,
         "transcript": transcript,
     }
@@ -509,7 +549,7 @@ def _convert_response_to_response_dict(response: types.GenerateContentResponse) 
         tool_calls_list: list[dict[str, Any]] = []
         text_content = None
         images: list[dict[str, Any]] = []
-        audio_part: types.Part | None = None
+        audio_blobs: list[types.Blob] = []
         # Gemini 3 signs the last non-function-call part of a text answer. It rides message.extra_content,
         # the same spelling Google's OpenAI-compatible endpoint uses.
         message_extra_content = None
@@ -541,17 +581,13 @@ def _convert_response_to_response_dict(response: types.GenerateContentResponse) 
             else:
                 if image := _inline_data_image(part):
                     images.append(image)
-                if (
-                    part.inline_data
-                    and isinstance(part.inline_data.mime_type, str)
-                    and part.inline_data.mime_type.startswith("audio/")
-                ):
-                    audio_part = part
+                if audio_blob := _inline_audio_blob(part):
+                    audio_blobs.append(audio_blob)
                 if part.text:
                     text_content = (text_content or "") + part.text
                 message_extra_content = _thought_signature_extra_content(part) or message_extra_content
 
-        audio = _inline_data_audio(audio_part, text_content or "") if audio_part else None
+        audio = _inline_data_audio(audio_blobs, text_content or "", playable=True)
 
         # Truncated or filtered responses produce a choice even without content or tool
         # calls, e.g. a thinking model that spent the whole max_output_tokens budget on
@@ -644,7 +680,7 @@ def _create_openai_chunk_from_google_chunk(
     tool_calls_list: list[ChoiceDeltaToolCall] = []
     message_extra_content = None
     images: list[dict[str, Any]] = []
-    audio_part: types.Part | None = None
+    audio_blobs: list[types.Blob] = []
 
     # Content can be absent on terminal chunks, e.g. when the response is truncated or
     # filtered before any part is produced; the finish reason must still be surfaced.
@@ -681,17 +717,13 @@ def _create_openai_chunk_from_google_chunk(
         else:
             if image := _inline_data_image(part):
                 images.append(image)
-            if (
-                part.inline_data
-                and isinstance(part.inline_data.mime_type, str)
-                and part.inline_data.mime_type.startswith("audio/")
-            ):
-                audio_part = part
+            if audio_blob := _inline_audio_blob(part):
+                audio_blobs.append(audio_blob)
             content += part.text or ""  # the signed final part may carry empty text
             message_extra_content = _thought_signature_extra_content(part) or message_extra_content
 
     audio = None
-    if audio_part and (converted_audio := _inline_data_audio(audio_part, content)):
+    if converted_audio := _inline_data_audio(audio_blobs, content, playable=False):
         audio = AudioContent(**converted_audio)
 
     # Unmapped reasons stay None so non-final chunks are not forced to a terminal reason.

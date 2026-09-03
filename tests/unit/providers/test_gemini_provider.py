@@ -1187,6 +1187,44 @@ def test_streaming_completion_with_inline_audio() -> None:
 def test_streaming_completion_emits_choice_for_audio_only_response() -> None:
     response = _make_gemini_response(
         [types.Part(inline_data=types.Blob(mime_type="audio/wav", data=b"WAVE"))],
+def _wav_fields(wav: bytes) -> tuple[bytes, int, int, bytes]:
+    """RIFF tag, sample rate, data length, payload."""
+    return wav[:4], int.from_bytes(wav[24:28], "little"), int.from_bytes(wav[40:44], "little"), wav[44:]
+
+
+@pytest.mark.parametrize("rate", [24000, 16000])
+def test_convert_response_wraps_pcm_audio_as_wav(rate: int) -> None:
+    """TTS returns headerless PCM whose sample rate exists only in the mime type; the message
+    carries a playable WAV with every audio part in order."""
+    mime_type = f"audio/L16;codec=pcm;rate={rate}"
+    response = _make_gemini_response(
+        [
+            types.Part(inline_data=types.Blob(mime_type=mime_type, data=b"\x01\x02")),
+            types.Part(inline_data=types.Blob(mime_type=mime_type, data=b"\x03\x04")),
+        ],
+        types.FinishReason.STOP,
+    )
+
+    result = GoogleProvider._convert_completion_response(
+        (_convert_response_to_response_dict(response), "gemini-2.5-flash-preview-tts")
+    )
+
+    audio = result.choices[0].message.audio
+    assert audio is not None
+    assert _wav_fields(base64.b64decode(audio.data)) == (b"RIFF", rate, 4, b"\x01\x02\x03\x04")
+    assert result.choices[0].message.content is None
+    assert result.choices[0].finish_reason == "stop"
+
+
+def test_streaming_completion_keeps_pcm_audio_raw() -> None:
+    """A streamed piece cannot carry a WAV header, since the total length is unknown, so it stays
+    raw PCM like OpenAI's pcm16 stream; parts within one chunk are joined in order."""
+    mime_type = "audio/L16;codec=pcm;rate=24000"
+    response = _make_gemini_response(
+        [
+            types.Part(inline_data=types.Blob(mime_type=mime_type, data=b"\x01\x02")),
+            types.Part(inline_data=types.Blob(mime_type=mime_type, data=b"\x03\x04")),
+        ],
         types.FinishReason.STOP,
     )
 
@@ -1194,6 +1232,18 @@ def test_streaming_completion_emits_choice_for_audio_only_response() -> None:
 
     assert chunk.choices[0].delta.audio is not None
     assert chunk.choices[0].delta.audio.data == "V0FWRQ=="
+    audio = chunk.choices[0].delta.audio
+    assert audio is not None
+    assert base64.b64decode(audio.data) == b"\x01\x02\x03\x04"
+
+
+def test_convert_response_skips_empty_audio_blob() -> None:
+    response = _make_gemini_response(
+        [types.Part(inline_data=types.Blob(mime_type="audio/L16;codec=pcm;rate=24000", data=b""))],
+        types.FinishReason.STOP,
+    )
+
+    assert _convert_response_to_response_dict(response)["choices"] == []
 
 
 def test_convert_response_emits_choice_for_filtered_response_without_content() -> None:

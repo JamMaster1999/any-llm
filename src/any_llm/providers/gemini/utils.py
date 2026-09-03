@@ -14,9 +14,9 @@ from any_llm.exceptions import InvalidRequestError, UnsupportedParameterError
 from any_llm.logging import logger
 from any_llm.types.batch import Batch, BatchRequestCounts, BatchResult, BatchResultError, BatchResultItem
 from any_llm.types.completion import (
-    AudioContent,
     ChatCompletionChunk,
     ChoiceDelta,
+    ChoiceDeltaAudio,
     ChoiceDeltaToolCall,
     ChoiceDeltaToolCallFunction,
     ChunkChoice,
@@ -724,7 +724,7 @@ def _create_openai_chunk_from_google_chunk(
 
     audio = None
     if converted_audio := _inline_data_audio(audio_blobs, content, playable=False):
-        audio = AudioContent(**converted_audio)
+        audio = ChoiceDeltaAudio(data=converted_audio["data"], transcript=converted_audio["transcript"] or None)
 
     # Unmapped reasons stay None so non-final chunks are not forced to a terminal reason.
     mapped_finish_reason = _map_finish_reason(candidate.finish_reason) if candidate else None

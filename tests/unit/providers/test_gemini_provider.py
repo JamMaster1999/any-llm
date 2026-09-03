@@ -1187,6 +1187,15 @@ def test_streaming_completion_with_inline_audio() -> None:
 def test_streaming_completion_emits_choice_for_audio_only_response() -> None:
     response = _make_gemini_response(
         [types.Part(inline_data=types.Blob(mime_type="audio/wav", data=b"WAVE"))],
+        types.FinishReason.STOP,
+    )
+
+    chunk = _create_openai_chunk_from_google_chunk(response)
+
+    assert chunk.choices[0].delta.audio is not None
+    assert chunk.choices[0].delta.audio.data == "V0FWRQ=="
+
+
 def _wav_fields(wav: bytes) -> tuple[bytes, int, int, bytes]:
     """RIFF tag, sample rate, data length, payload."""
     return wav[:4], int.from_bytes(wav[24:28], "little"), int.from_bytes(wav[40:44], "little"), wav[44:]
@@ -1230,10 +1239,9 @@ def test_streaming_completion_keeps_pcm_audio_raw() -> None:
 
     chunk = _create_openai_chunk_from_google_chunk(response)
 
-    assert chunk.choices[0].delta.audio is not None
-    assert chunk.choices[0].delta.audio.data == "V0FWRQ=="
     audio = chunk.choices[0].delta.audio
     assert audio is not None
+    assert audio.data is not None
     assert base64.b64decode(audio.data) == b"\x01\x02\x03\x04"
 
 

@@ -3099,7 +3099,42 @@ def test_convert_messages_tool_result_image_url_must_be_a_data_uri() -> None:
         },
     ]
 
-    with pytest.raises(UnsupportedParameterError, match="image URL in a tool message"):
+    with pytest.raises(UnsupportedParameterError, match="image_url by reference in a tool message"):
+        _convert_messages(messages)
+
+
+def test_convert_messages_tool_result_pdf_becomes_a_function_response_part() -> None:
+    pdf_b64 = base64.b64encode(b"%PDF-1.4 test").decode("utf-8")
+    messages: list[dict[str, Any]] = [
+        {"role": "assistant", "tool_calls": [_tool_call("c1", "read_file")]},
+        {
+            "role": "tool",
+            "tool_call_id": "c1",
+            "content": [
+                {"type": "text", "text": "File attached."},
+                {"type": "file", "file": {"file_data": f"data:application/pdf;base64,{pdf_b64}", "filename": "a.pdf"}},
+            ],
+        },
+    ]
+
+    contents, _ = _convert_messages(messages)
+
+    assert contents[1].parts is not None
+    function_response = contents[1].parts[0].function_response
+    assert function_response is not None
+    assert function_response.response == {"result": [{"type": "text", "text": "File attached."}]}
+    assert function_response.parts is not None
+    blob = function_response.parts[0].inline_data
+    assert blob is not None
+    assert (blob.mime_type, blob.data) == ("application/pdf", b"%PDF-1.4 test")
+
+
+def test_convert_messages_tool_result_file_id_raises() -> None:
+    messages: list[dict[str, Any]] = [
+        {"role": "tool", "tool_call_id": "c1", "content": [{"type": "file", "file": {"file_id": "files/abc"}}]},
+    ]
+
+    with pytest.raises(UnsupportedParameterError, match="file by reference in a tool message"):
         _convert_messages(messages)
 
 

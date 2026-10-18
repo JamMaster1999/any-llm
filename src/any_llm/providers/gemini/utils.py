@@ -262,6 +262,16 @@ def _convert_image_url_to_part(block: dict[str, Any], provider_name: str) -> typ
     return types.Part.from_uri(file_uri=url, mime_type=guessed_type or "image/jpeg")
 
 
+def _convert_tool_image_to_part(block: dict[str, Any], provider_name: str) -> types.FunctionResponsePart:
+    url = block.get("image_url", {}).get("url")
+    if not isinstance(url, str) or not url.startswith("data:"):
+        # The Gemini API ignores a file URI in a function response instead of rejecting it.
+        msg = "image URL in a tool message"
+        raise UnsupportedParameterError(msg, provider_name, "Send a tool result's image as a base64 data URI.")
+    mime_type, raw_data = _parse_data_uri(url, "image_url.url", provider_name)
+    return types.FunctionResponsePart.from_bytes(data=raw_data, mime_type=mime_type)
+
+
 def _convert_input_audio_to_part(block: dict[str, Any], provider_name: str) -> types.Part:
     """OpenAI's input_audio part: base64 data plus a format name, which Gemini spells as audio/<format>."""
     audio = block.get("input_audio")
@@ -544,10 +554,20 @@ def _convert_messages(
         elif message["role"] == "tool":
             name = message.get("name") or tool_names.get(message.get("tool_call_id", ""), "unknown")
             content = message["content"]
-            if isinstance(content, (str, bytes, bytearray)):
+            images: list[types.FunctionResponsePart] = []
+            if isinstance(content, list):
+                # Gemini 3 sees an image in a function response only as one of its parts; inside the
+                # JSON response it is base64 text.
+                images = [
+                    _convert_tool_image_to_part(block, provider_name) for block in content if _is_image_url_block(block)
+                ]
+                content = [block for block in content if not _is_image_url_block(block)]
+            elif isinstance(content, (str, bytes, bytearray)):
                 with suppress(json.JSONDecodeError, UnicodeDecodeError):
                     content = json.loads(content)
-            part = types.Part.from_function_response(name=name, response=_normalize_tool_response(content))
+            part = types.Part.from_function_response(
+                name=name, response=_normalize_tool_response(content), parts=images or None
+            )
             # The API documents only "user" and "model" as Content roles. "function" is tolerated by
             # older models and rejected with 400 INVALID_ARGUMENT by gemini-3.5-flash-lite, 3.7-flash
             # and 3.8-flash. Results of parallel calls share one user turn, as google-genai emits them.
@@ -562,6 +582,10 @@ def _convert_messages(
         return [types.Content(role="user", parts=[types.Part.from_text(text=system_instruction)])], None
 
     return formatted_messages, system_instruction
+
+
+def _is_image_url_block(block: Any) -> bool:
+    return isinstance(block, dict) and block.get("type") == "image_url"
 
 
 def _normalize_tool_response(response: Any) -> dict[str, Any]:

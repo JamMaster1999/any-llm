@@ -262,13 +262,17 @@ def _convert_image_url_to_part(block: dict[str, Any], provider_name: str) -> typ
     return types.Part.from_uri(file_uri=url, mime_type=guessed_type or "image/jpeg")
 
 
-def _convert_tool_image_to_part(block: dict[str, Any], provider_name: str) -> types.FunctionResponsePart:
-    url = block.get("image_url", {}).get("url")
-    if not isinstance(url, str) or not url.startswith("data:"):
+def _convert_tool_media_to_part(block: dict[str, Any], provider_name: str) -> types.FunctionResponsePart:
+    """An image_url or file block of a tool result as a function response part."""
+    if block["type"] == "image_url":
+        field, uri = "image_url.url", block.get("image_url", {}).get("url")
+    else:
+        field, uri = "file.file_data", block.get("file", {}).get("file_data")
+    if not isinstance(uri, str) or not uri.startswith("data:"):
         # The Gemini API ignores a file URI in a function response instead of rejecting it.
-        msg = "image URL in a tool message"
-        raise UnsupportedParameterError(msg, provider_name, "Send a tool result's image as a base64 data URI.")
-    mime_type, raw_data = _parse_data_uri(url, "image_url.url", provider_name)
+        msg = f"{block['type']} by reference in a tool message"
+        raise UnsupportedParameterError(msg, provider_name, "Send a tool result's media as a base64 data URI.")
+    mime_type, raw_data = _parse_data_uri(uri, field, provider_name)
     return types.FunctionResponsePart.from_bytes(data=raw_data, mime_type=mime_type)
 
 
@@ -554,19 +558,19 @@ def _convert_messages(
         elif message["role"] == "tool":
             name = message.get("name") or tool_names.get(message.get("tool_call_id", ""), "unknown")
             content = message["content"]
-            images: list[types.FunctionResponsePart] = []
+            media: list[types.FunctionResponsePart] = []
             if isinstance(content, list):
-                # Gemini 3 sees an image in a function response only as one of its parts; inside the
-                # JSON response it is base64 text.
-                images = [
-                    _convert_tool_image_to_part(block, provider_name) for block in content if _is_image_url_block(block)
+                # Gemini 3 sees an image or a PDF in a function response only as one of its parts; inside
+                # the JSON response it is base64 text.
+                media = [
+                    _convert_tool_media_to_part(block, provider_name) for block in content if _is_media_block(block)
                 ]
-                content = [block for block in content if not _is_image_url_block(block)]
+                content = [block for block in content if not _is_media_block(block)]
             elif isinstance(content, (str, bytes, bytearray)):
                 with suppress(json.JSONDecodeError, UnicodeDecodeError):
                     content = json.loads(content)
             part = types.Part.from_function_response(
-                name=name, response=_normalize_tool_response(content), parts=images or None
+                name=name, response=_normalize_tool_response(content), parts=media or None
             )
             # The API documents only "user" and "model" as Content roles. "function" is tolerated by
             # older models and rejected with 400 INVALID_ARGUMENT by gemini-3.5-flash-lite, 3.7-flash
@@ -584,8 +588,8 @@ def _convert_messages(
     return formatted_messages, system_instruction
 
 
-def _is_image_url_block(block: Any) -> bool:
-    return isinstance(block, dict) and block.get("type") == "image_url"
+def _is_media_block(block: Any) -> bool:
+    return isinstance(block, dict) and block.get("type") in ("image_url", "file")
 
 
 def _normalize_tool_response(response: Any) -> dict[str, Any]:

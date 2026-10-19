@@ -628,6 +628,38 @@ def test_convert_tool_spec_type_union_routes_through_json_schema() -> None:
     assert decl.parameters_json_schema == raw_params
 
 
+def test_convert_tool_spec_additional_properties_routes_through_json_schema() -> None:
+    """A tool schema with ``additionalProperties`` must not be reshaped.
+
+    ``types.Schema`` serializes the key as ``additional_properties``, and Gemini answers 400
+    "Unknown name additional_properties". Raw JSON Schema carries it through.
+    """
+    raw_params = {
+        "type": "object",
+        "properties": {
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}, "done": {"type": "boolean"}},
+                    "required": ["text", "done"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["items"],
+    }
+    openai_tools = [
+        {"type": "function", "function": {"name": "todo", "description": "Replace the list.", "parameters": raw_params}}
+    ]
+
+    tools = _convert_tool_spec(openai_tools, "gemini")
+
+    decl = tools[0].function_declarations[0]  # type: ignore[index]
+    assert decl.parameters is None
+    assert decl.parameters_json_schema == raw_params
+
+
 def test_convert_tool_spec_without_type_unions_still_uses_openapi_path() -> None:
     """The reshaping path is unchanged for schemas types.Schema can represent."""
     openai_tools = [
@@ -1647,8 +1679,6 @@ def test_convert_tool_spec_basic_mapping() -> None:
                         "count_list": {"type": "array", "items": {"type": "integer"}},
                         # Enum should be preserved
                         "mode": {"type": "string", "enum": ["a", "b"]},
-                        # additionalProperties should be dropped
-                        "config": {"type": "object", "additionalProperties": {"type": "integer"}},
                     },
                     "required": ["query"],
                 },
@@ -1666,8 +1696,6 @@ def test_convert_tool_spec_basic_mapping() -> None:
     assert tools[0].function_declarations[0].parameters.properties["opts"].type == "ARRAY"  # type: ignore[union-attr, index]
     assert tools[0].function_declarations[0].parameters.properties["count_list"].type == "ARRAY"  # type: ignore[union-attr, index]
     assert tools[0].function_declarations[0].parameters.properties["mode"].type == "STRING"  # type: ignore[union-attr, index]
-    assert tools[0].function_declarations[0].parameters.properties["config"].type == "OBJECT"  # type: ignore[union-attr, index]
-    assert "additionalProperties" not in tools[0].function_declarations[0].parameters.properties["config"]  # type: ignore[union-attr, index]
 
 
 def test_convert_tool_spec_none_parameters() -> None:

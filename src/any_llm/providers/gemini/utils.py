@@ -75,8 +75,9 @@ def _has_additional_properties(schema: Any) -> bool:
     """Return True if *schema* sets ``additionalProperties`` anywhere, nested included.
 
     ``google.genai.types.Schema`` serializes the key as ``additional_properties``, which the
-    Gemini API rejects with a 400. Such schemas must be routed through
-    ``GenerateContentConfig.response_json_schema``, which the SDK forwards as raw JSON Schema.
+    Gemini API rejects with a 400. Such schemas must be routed through raw JSON Schema:
+    ``GenerateContentConfig.response_json_schema`` for a response format, and
+    ``FunctionDeclaration.parameters_json_schema`` for a tool, which the SDK forwards as is.
     """
     if isinstance(schema, dict):
         if "additionalProperties" in schema:
@@ -108,7 +109,7 @@ def _convert_tool_spec(tools: list[dict[str, Any] | Any], provider_name: str) ->
         function = tool["function"]
         params: dict[str, Any] = function.get("parameters") or {}
 
-        if _has_json_schema_refs(params) or _has_type_unions(params):
+        if _has_json_schema_refs(params) or _has_type_unions(params) or _has_additional_properties(params):
             function_declarations.append(
                 types.FunctionDeclaration(
                     name=function["name"],

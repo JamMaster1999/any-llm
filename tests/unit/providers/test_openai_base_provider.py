@@ -7,6 +7,7 @@ import json
 import logging
 import pathlib
 from collections.abc import AsyncIterator
+from typing import Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -331,6 +332,45 @@ async def test_aresponses_without_response_format_returns_response(mock_openai_c
     assert "context_management" not in mock_client.responses.create.call_args.kwargs
     assert isinstance(result, Response)
     assert not isinstance(result, ParsedResponse)
+
+
+@pytest.mark.asyncio
+@patch("any_llm.providers.openai.base.AsyncOpenAI")
+async def test_openai_aresponses_returns_its_own_response_with_every_field(mock_openai_class: MagicMock) -> None:
+    """OpenAI's reply stays an openai Response: a ResponseResource would drop cache_write_tokens."""
+    reply = Response.model_validate(
+        {
+            **_make_openai_response("hi").model_dump(),
+            # the fields a real OpenAI reply carries, so the ResponseResource conversion would succeed
+            "status": "completed",
+            "truncation": "disabled",
+            "text": {"format": {"type": "text"}},
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
+            "top_logprobs": 0,
+            "store": True,
+            "background": False,
+            "service_tier": "default",
+            "usage": {
+                "input_tokens": 10,
+                "input_tokens_details": {"cached_tokens": 2, "cache_write_tokens": 8},
+                "output_tokens": 1,
+                "output_tokens_details": {"reasoning_tokens": 0},
+                "total_tokens": 11,
+            },
+        }
+    )
+    mock_client = AsyncMock()
+    mock_client.responses.create = AsyncMock(return_value=reply)
+    mock_openai_class.return_value = mock_client
+
+    result = await OpenaiProvider(api_key="key").aresponses(model="gpt-5.6", input_data="hi")
+
+    assert isinstance(result, Response)
+    assert result.usage is not None
+    assert result.usage.input_tokens_details.cache_write_tokens == 8
 
 
 @pytest.mark.asyncio
@@ -966,7 +1006,9 @@ async def test_transcription_missing_path_raises_before_any_request(tmp_path: pa
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("response_format", ["text", "srt", "vtt"])
-async def test_transcription_wraps_text_formats_in_a_transcription(response_format: str) -> None:
+async def test_transcription_wraps_text_formats_in_a_transcription(
+    response_format: Literal["text", "srt", "vtt"],
+) -> None:
     """The SDK hands back the raw body for text formats; callers always get a Transcription."""
     requests: list[httpx.Request] = []
 

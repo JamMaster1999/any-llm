@@ -75,8 +75,9 @@ def _has_additional_properties(schema: Any) -> bool:
     """Return True if *schema* sets ``additionalProperties`` anywhere, nested included.
 
     ``google.genai.types.Schema`` serializes the key as ``additional_properties``, which the
-    Gemini API rejects with a 400. Such schemas must be routed through
-    ``GenerateContentConfig.response_json_schema``, which the SDK forwards as raw JSON Schema.
+    Gemini API rejects with a 400. Such schemas must be routed as raw JSON Schema:
+    ``GenerateContentConfig.response_json_schema`` for a response, and
+    ``FunctionDeclaration.parameters_json_schema`` for a tool's parameters.
     """
     if isinstance(schema, dict):
         if "additionalProperties" in schema:
@@ -85,6 +86,15 @@ def _has_additional_properties(schema: Any) -> bool:
     if isinstance(schema, list):
         return any(_has_additional_properties(v) for v in schema)
     return False
+
+
+def _raw_function_declaration(function: dict[str, Any], params: dict[str, Any]) -> types.FunctionDeclaration:
+    """A declaration whose parameters the SDK forwards to the server as raw JSON Schema."""
+    return types.FunctionDeclaration(
+        name=function["name"],
+        description=function.get("description", ""),
+        parameters_json_schema=params,
+    )
 
 
 def _convert_tool_spec(tools: list[dict[str, Any] | Any], provider_name: str) -> list[types.Tool]:
@@ -109,13 +119,7 @@ def _convert_tool_spec(tools: list[dict[str, Any] | Any], provider_name: str) ->
         params: dict[str, Any] = function.get("parameters") or {}
 
         if _has_json_schema_refs(params) or _has_type_unions(params):
-            function_declarations.append(
-                types.FunctionDeclaration(
-                    name=function["name"],
-                    description=function.get("description", ""),
-                    parameters_json_schema=params,
-                )
-            )
+            function_declarations.append(_raw_function_declaration(function, params))
             continue
 
         properties: dict[str, dict[str, Any]] = {}
@@ -138,11 +142,27 @@ def _convert_tool_spec(tools: list[dict[str, Any] | Any], provider_name: str) ->
             "required": params.get("required", []),
         }
 
+        # An ``items`` schema is copied verbatim, so it can carry valid JSON Schema that
+        # ``types.Schema`` does not model (``exclusiveMinimum``, ``const``, ...) or misserializes
+        # (``additionalProperties``). Such a schema goes out raw, as one with a ``$ref`` does. Any
+        # other validation error is the schema's own and is refused here, before the request.
+        if any(_has_additional_properties(prop.get("items")) for prop in properties.values()):
+            function_declarations.append(_raw_function_declaration(function, params))
+            continue
+        try:
+            parameters = types.Schema(**parameters_dict)
+        except ValidationError as exc:
+            if any(error["type"] != "extra_forbidden" for error in exc.errors()):
+                msg = f"Tool {function['name']!r} has an invalid parameters schema: {exc.errors()[0]['msg']}"
+                raise InvalidRequestError(msg, provider_name=provider_name) from exc
+            function_declarations.append(_raw_function_declaration(function, params))
+            continue
+
         function_declarations.append(
             types.FunctionDeclaration(
                 name=function["name"],
                 description=function.get("description", ""),
-                parameters=types.Schema(**parameters_dict),
+                parameters=parameters,
             )
         )
     if function_declarations:
@@ -570,13 +590,25 @@ def _normalize_tool_response(response: Any) -> dict[str, Any]:
     return {"result": response}
 
 
+def _tokens_by_modality(*count_lists: list[types.ModalityTokenCount] | None) -> dict[types.MediaModality, int]:
+    totals: dict[types.MediaModality, int] = {}
+    for counts in count_lists:
+        for count in counts or []:
+            if count.modality is not None and count.token_count:
+                totals[count.modality] = totals.get(count.modality, 0) + count.token_count
+    return totals
+
+
 def _extract_usage_dict(response: types.GenerateContentResponse) -> dict[str, Any]:
     """Extract Gemini usage using OpenAI-compatible inclusive token counts.
 
     Gemini's ``prompt_token_count`` already includes cached tokens
     (``cached_content_token_count`` is a subset). Gemini reports tool-use prompt
     tokens and thinking tokens separately, while OpenAI includes those categories
-    in ``prompt_tokens`` and ``completion_tokens`` respectively.
+    in ``prompt_tokens`` and ``completion_tokens`` respectively. Audio and image
+    output tokens stay inside ``completion_tokens`` and are broken out in its details;
+    audio input tokens are broken out of ``prompt_tokens`` the same way, since Gemini
+    prices audio input above text.
 
     Reference: https://ai.google.dev/api/generate-content#UsageMetadata
     """
@@ -588,10 +620,20 @@ def _extract_usage_dict(response: types.GenerateContentResponse) -> dict[str, An
         "completion_tokens": (metadata.candidates_token_count or 0) + (metadata.thoughts_token_count or 0),
         "total_tokens": metadata.total_token_count or 0,
     }
-    if metadata.thoughts_token_count:
-        usage["completion_tokens_details"] = CompletionTokensDetails(reasoning_tokens=metadata.thoughts_token_count)
-    if metadata.cached_content_token_count:
-        usage["prompt_tokens_details"] = PromptTokensDetails(cached_tokens=metadata.cached_content_token_count)
+    output_modalities = _tokens_by_modality(metadata.candidates_tokens_details)
+    audio_tokens = output_modalities.get(types.MediaModality.AUDIO)
+    image_tokens = output_modalities.get(types.MediaModality.IMAGE)
+    if metadata.thoughts_token_count or audio_tokens or image_tokens:
+        usage["completion_tokens_details"] = CompletionTokensDetails(
+            reasoning_tokens=metadata.thoughts_token_count, audio_tokens=audio_tokens, image_tokens=image_tokens
+        )
+    input_audio_tokens = _tokens_by_modality(
+        metadata.prompt_tokens_details, metadata.tool_use_prompt_tokens_details
+    ).get(types.MediaModality.AUDIO)
+    if metadata.cached_content_token_count or input_audio_tokens:
+        usage["prompt_tokens_details"] = PromptTokensDetails(
+            cached_tokens=metadata.cached_content_token_count, audio_tokens=input_audio_tokens
+        )
     return usage
 
 
@@ -1001,20 +1043,7 @@ def _create_openai_chunk_from_google_chunk(
         finish_reason=finish_reason,
     )
 
-    usage = None
-    if response.usage_metadata:
-        cached_tokens = response.usage_metadata.cached_content_token_count
-        thought_tokens = response.usage_metadata.thoughts_token_count
-        usage = CompletionUsage(
-            prompt_tokens=(response.usage_metadata.prompt_token_count or 0)
-            + (response.usage_metadata.tool_use_prompt_token_count or 0),
-            completion_tokens=(response.usage_metadata.candidates_token_count or 0) + (thought_tokens or 0),
-            total_tokens=response.usage_metadata.total_token_count or 0,
-            prompt_tokens_details=PromptTokensDetails(cached_tokens=cached_tokens) if cached_tokens else None,
-            completion_tokens_details=CompletionTokensDetails(reasoning_tokens=thought_tokens)
-            if thought_tokens
-            else None,
-        )
+    usage = CompletionUsage(**_extract_usage_dict(response)) if response.usage_metadata else None
 
     return ChatCompletionChunk(
         id=f"chatcmpl-{time()}",
